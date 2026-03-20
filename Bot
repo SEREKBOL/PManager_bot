@@ -1,0 +1,711 @@
+import logging
+from typing import Dict
+import aiohttp
+import json
+import os
+import asyncio
+import time
+from collections import defaultdict
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, BotCommand, BotCommandScopeChat
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+# Logging setup - хамгийн бага түвшинд
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.CRITICAL
+)
+logger = logging.getLogger(__name__)
+
+# Configuration
+BOT_TOKEN = "8326954571:AAEyMD0hyr6tB5kOuUJmOSyu468xOcDmyRI"
+API_BASE_URL = "https://kayzennv3.squareweb.app/api"
+API_KEY = "APIKEY38"
+MASTER_ADMIN_ID = "6822729424"  # Зөвхөн энэ ID л админ
+
+ALLOWED_USERS_FILE = "TEST.user.json"
+
+# Session timeout (24 hours)
+SESSION_TIMEOUT = 24 * 60 * 60
+
+# ACCESS DENIED message
+ACCESS_DENIED_MESSAGE = "🚫 Access Denied. • 🚫 Арил сда минь."
+
+# ========== LOG, МЭДЭЭЛЭЛ АРИЛГАСАН ==========
+# Ямар ч лог файл байхгүй
+# Ямар ч мэдээлэл админд явахгүй
+# =============================================
+
+# Load allowed users
+def load_allowed_users():
+    if os.path.exists(ALLOWED_USERS_FILE):
+        with open(ALLOWED_USERS_FILE, 'r') as f:
+            return json.load(f)
+    return []
+
+def save_allowed_users(users):
+    with open(ALLOWED_USERS_FILE, 'w') as f:
+        json.dump(users, f, indent=4)
+
+allowed_users = load_allowed_users()
+
+# User sessions
+user_sessions = defaultdict(lambda: {
+    'auth_token': None,
+    'email': None,
+    'last_activity': time.time()
+})
+
+def cleanup_old_sessions():
+    current_time = time.time()
+    expired = [uid for uid, data in user_sessions.items()
+               if current_time - data.get('last_activity', 0) > SESSION_TIMEOUT]
+    for uid in expired:
+        del user_sessions[uid]
+
+# ========== KEYBOARDS ==========
+def get_user_keyboard():
+    keyboard = [
+        [KeyboardButton("📝 Register"), KeyboardButton("🔑 Login")],
+        [KeyboardButton("⭐ Set Rank"), KeyboardButton("🔒 Change Password")],
+        [KeyboardButton("📧 Change Email"), KeyboardButton("📊 My Info")],
+        [KeyboardButton("🗑️ Delete Account"), KeyboardButton("❌ Logout")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def get_admin_keyboard():
+    keyboard = [
+        [KeyboardButton("📝 Register"), KeyboardButton("🔑 Login")],
+        [KeyboardButton("⭐ Set Rank"), KeyboardButton("🔒 Change Password")],
+        [KeyboardButton("📧 Change Email"), KeyboardButton("📊 My Info")],
+        [KeyboardButton("🗑️ Delete Account"), KeyboardButton("❌ Logout")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+# ===============================
+
+def is_master_admin(user_id):
+    return str(user_id) == MASTER_ADMIN_ID
+
+def is_allowed(user_id):
+    return is_master_admin(user_id) or str(user_id) in allowed_users
+
+async def send_access_denied(update: Update):
+    try:
+        await update.message.reply_text(
+            ACCESS_DENIED_MESSAGE,
+            parse_mode='Markdown'
+        )
+    except:
+        pass
+
+class CPMApiClient:
+    def __init__(self):
+        self.base_url = API_BASE_URL
+        self.api_key = API_KEY
+
+    async def make_request(self, endpoint: str, data: dict) -> Dict:
+        url = f"{self.base_url}/{endpoint}"
+        params = {"api_key": self.api_key}
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, params=params, json=data, timeout=30) as response:
+                    if response.status == 200:
+                        response_data = await response.json()
+                        if response_data.get("error") == 0 and response_data.get("ok"):
+                            return {"ok": True, "data": response_data}
+                        else:
+                            return {"ok": False, "error": response_data.get("message", "An error occurred")}
+                    else:
+                        return {"ok": False, "error": f"HTTP error {response.status}"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    async def register(self, email: str, password: str) -> Dict:
+        return await self.make_request("account_register", {
+            "account_email": email,
+            "account_password": password
+        })
+
+    async def login(self, email: str, password: str) -> Dict:
+        return await self.make_request("account_login", {
+            "account_email": email,
+            "account_password": password
+        })
+
+    async def set_rank(self, auth_token: str) -> Dict:
+        return await self.make_request("set_rank", {
+            "account_auth": auth_token
+        })
+
+    async def change_password(self, auth_token: str, new_password: str) -> Dict:
+        return await self.make_request("change_password", {
+            "account_auth": auth_token,
+            "new_password": new_password
+        })
+
+    async def change_email(self, auth_token: str, new_email: str) -> Dict:
+        return await self.make_request("change_email", {
+            "account_auth": auth_token,
+            "new_email": new_email
+        })
+
+    async def delete_account(self, auth_token: str) -> Dict:
+        return await self.make_request("delete_account", {
+            "account_auth": auth_token
+        })
+
+# ========== ACCESS CONTROL - ЮУ Ч ИЛГЭЭХГҮЙ ==========
+async def access_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = str(update.effective_user.id)
+
+        if user_id in user_sessions:
+            user_sessions[user_id]['last_activity'] = time.time()
+
+        if not is_allowed(user_id):
+            await send_access_denied(update)
+            return False
+
+        return True
+
+    except Exception as e:
+        logger.error(f"Error in access_control: {e}")
+        return False
+# ====================================================
+
+# Хэрэглэгчийн төлөв хадгалах
+user_states = {}
+
+# ========== START COMMAND ==========
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await access_control(update, context):
+        return
+
+    user_id = str(update.effective_user.id)
+
+    if user_id not in user_sessions:
+        user_sessions[user_id] = {
+            'auth_token': None,
+            'email': None,
+            'last_activity': time.time()
+        }
+
+    if is_master_admin(user_id):
+        # Master admin-д admin keyboard харуулах
+        welcome_text = (
+            "😎 **SEREKBOLIIN BOTOD TAWTAI MORILNO UU** 😘\n\n"
+            f"Hello 🥀!\n"
+            f"👑 **YOU ARE ADMIN** 👑\n\n"
+            "👇 **ADMIN COMMANDS:**\n"
+            "/list - 📋 List members\n"
+            "/add - ➕ Add member\n"
+            "/remove - 🚫 Delete member\n\n"
+            "👇 **Use the buttons below for CPM functions:**"
+        )
+        await update.message.reply_text(
+            welcome_text,
+            reply_markup=get_admin_keyboard(),
+            parse_mode='Markdown'
+        )
+    else:
+        # Ердийн хэрэглэгчдэд user keyboard харуулах
+        welcome_text = (
+            "😎 **SEREKBOLIIN BOTOD TAWTAI MORILNO UU** 😘\n\n"
+            f"Hello {update.effective_user.first_name}!\n"
+            f"✅ **YOU ARE AUTHORIZED** ✅\n\n"
+            "👇 **Use the buttons below:**"
+        )
+        await update.message.reply_text(
+            welcome_text,
+            reply_markup=get_user_keyboard(),
+            parse_mode='Markdown'
+        )
+
+# ========== ADMIN COMMANDS ==========
+
+# /list command
+async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await access_control(update, context):
+        return
+
+    user_id = str(update.effective_user.id)
+
+    if not is_master_admin(user_id):
+        await update.message.reply_text("❌ Only master admin can use this command!")
+        return
+
+    if not allowed_users:
+        await update.message.reply_text("📋 No members yet.")
+        return
+
+    text = "📋 **MEMBERS LIST** ✨\n\n"
+    for i, uid in enumerate(allowed_users, 1):
+        text += f"{i}. 🆔 `{uid}`\n"
+
+    text += f"\n👑 **MASTER ADMIN:** `{MASTER_ADMIN_ID}`\n"
+    text += f"\n📊 **TOTAL MEMBERS:** {len(allowed_users)}"
+
+    await update.message.reply_text(text, parse_mode='Markdown')
+
+# /add command - ID асууна
+async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await access_control(update, context):
+        return
+
+    user_id = str(update.effective_user.id)
+
+    if not is_master_admin(user_id):
+        await update.message.reply_text("❌ Only master admin can use this command!")
+        return
+
+    # Хэрэглэгчийн төлөвийг 'awaiting_add_id' болгож тохируулах
+    user_states[user_id] = 'awaiting_add_id'
+    await update.message.reply_text(
+        "📝 **Telegram ID оруулна уу:**\n\n"
+        "Дараа ID-г бичнэ үү.",
+        parse_mode='Markdown'
+    )
+
+# /remove command - ID асууна
+async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await access_control(update, context):
+        return
+
+    user_id = str(update.effective_user.id)
+
+    if not is_master_admin(user_id):
+        await update.message.reply_text("❌ Only master admin can use this command!")
+        return
+
+    # Хэрэглэгчийн төлөвийг 'awaiting_remove_id' болгож тохируулах
+    user_states[user_id] = 'awaiting_remove_id'
+    await update.message.reply_text(
+        "📝 **Telegram ID оруулна уу:**\n\n"
+        "Дараа ID-г бичнэ үү.",
+        parse_mode='Markdown'
+    )
+
+# ========== BUTTON HANDLERS ==========
+async def handle_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['state'] = 'register_email'
+    await update.message.reply_text("📧 Please enter your email:")
+
+async def handle_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['state'] = 'login_email'
+    await update.message.reply_text("📧 Please enter your email:")
+
+async def handle_set_rank(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if not user_sessions[user_id]['auth_token']:
+        await update.message.reply_text("❌ Please login first!")
+        return
+    await update.message.reply_text("⏳ Setting rank...")
+
+    client = CPMApiClient()
+    response = await client.set_rank(user_sessions[user_id]['auth_token'])
+
+    if response["ok"]:
+        await update.message.reply_text("✅ Rank set successfully!")
+    else:
+        await update.message.reply_text(f"❌ Error: {response.get('error', 'Failed to set rank')}")
+
+async def handle_change_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if not user_sessions[user_id]['auth_token']:
+        await update.message.reply_text("❌ Please login first!")
+        return
+    context.user_data['state'] = 'change_password'
+    await update.message.reply_text("🔑 Please enter your new password (minimum 6 characters):")
+
+async def handle_change_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if not user_sessions[user_id]['auth_token']:
+        await update.message.reply_text("❌ Please login first!")
+        return
+    context.user_data['state'] = 'change_email'
+    await update.message.reply_text("📧 Please enter your new email:")
+
+async def handle_my_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if user_sessions[user_id]['auth_token']:
+        info = f"📊 **Your Information**\n\n✅ Logged in: Yes\n📧 Email: `{user_sessions[user_id]['email']}`"
+    else:
+        info = "❌ You are not logged in"
+    await update.message.reply_text(info, parse_mode='Markdown')
+
+async def handle_delete_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if not user_sessions[user_id]['auth_token']:
+        await update.message.reply_text("❌ Please login first!")
+        return
+    context.user_data['state'] = 'confirm_delete'
+    await update.message.reply_text(
+        "⚠️ **WARNING!** ⚠️\n\n"
+        "Are you sure you want to delete your account?\n"
+        "This action cannot be undone!\n\n"
+        "Type **YES** to confirm or anything else to cancel.",
+        parse_mode='Markdown'
+    )
+
+async def handle_logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    user_sessions[user_id] = {
+        'auth_token': None,
+        'email': None,
+        'last_activity': time.time()
+    }
+
+    keyboard = get_admin_keyboard() if is_master_admin(user_id) else get_user_keyboard()
+    await update.message.reply_text("👋 Successfully logged out!", reply_markup=keyboard)
+
+# Main message handler
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await access_control(update, context):
+        return
+
+    if not update.message or not update.message.text:
+        return
+
+    text = update.message.text
+    user_id = str(update.effective_user.id)
+    user = update.effective_user
+
+    if user_id not in user_sessions:
+        user_sessions[user_id] = {
+            'auth_token': None,
+            'email': None,
+            'last_activity': time.time()
+        }
+
+    user_sessions[user_id]['last_activity'] = time.time()
+
+    # ===== ADMIN COMMANDS STATE - ID АСУУХ ХЭСЭГ =====
+    if user_id in user_states:
+        state = user_states[user_id]
+
+        # Add command state - ID хүлээж авах
+        if state == 'awaiting_add_id':
+            new_user_id = text.strip()
+
+            if not new_user_id.isdigit():
+                await update.message.reply_text(
+                    "❌ ID must contain only numbers! Try again or use /add to restart.",
+                    parse_mode='Markdown'
+                )
+                return
+
+            if new_user_id in allowed_users:
+                await update.message.reply_text(
+                    f"❌ `{new_user_id}` is already a member!",
+                    parse_mode='Markdown'
+                )
+            elif new_user_id == MASTER_ADMIN_ID:
+                await update.message.reply_text(
+                    "❌ Master admin is always a member!",
+                    parse_mode='Markdown'
+                )
+            else:
+                allowed_users.append(new_user_id)
+                save_allowed_users(allowed_users)
+
+                await update.message.reply_text(
+                    f"✅ Member `{new_user_id}` successfully added! 😉",
+                    parse_mode='Markdown'
+                )
+
+                # Шинэ хэрэглэгчдэд мэдэгдэх
+                try:
+                    await context.bot.send_message(
+                        chat_id=new_user_id,
+                        text="✅ **WELCOME!**\n\nYou now have access to use this bot!\nPress /start to begin.",
+                        parse_mode='Markdown'
+                    )
+                except:
+                    pass
+
+            # Төлөвийг арилгах
+            del user_states[user_id]
+            return
+
+        # Remove command state - ID хүлээж авах
+        elif state == 'awaiting_remove_id':
+            remove_user_id = text.strip()
+
+            if not remove_user_id.isdigit():
+                await update.message.reply_text(
+                    "❌ ID must contain only numbers! Try again or use /remove to restart.",
+                    parse_mode='Markdown'
+                )
+                return
+
+            if remove_user_id not in allowed_users:
+                await update.message.reply_text(
+                    f"❌ `{remove_user_id}` is not a member!",
+                    parse_mode='Markdown'
+                )
+            else:
+                allowed_users.remove(remove_user_id)
+                save_allowed_users(allowed_users)
+
+                await update.message.reply_text(
+                    f"✅ Member `{remove_user_id}` successfully deleted! 🚫",
+                    parse_mode='Markdown'
+                )
+
+                # Устгагдсан хэрэглэгчдэд мэдэгдэх
+                try:
+                    await context.bot.send_message(
+                        chat_id=remove_user_id,
+                        text="⛔ **ACCESS REVOKED** ⛔\n\nYour access has been removed.",
+                        parse_mode='Markdown'
+                    )
+                except:
+                    pass
+
+            # Төлөвийг арилгах
+            del user_states[user_id]
+            return
+
+    # ===== BUTTON HANDLERS =====
+    if text == "📝 Register":
+        await handle_register(update, context)
+    elif text == "🔑 Login":
+        await handle_login(update, context)
+    elif text == "⭐ Set Rank":
+        await handle_set_rank(update, context)
+    elif text == "🔒 Change Password":
+        await handle_change_password(update, context)
+    elif text == "📧 Change Email":
+        await handle_change_email(update, context)
+    elif text == "📊 My Info":
+        await handle_my_info(update, context)
+    elif text == "🗑️ Delete Account":
+        await handle_delete_account(update, context)
+    elif text == "❌ Logout":
+        await handle_logout(update, context)
+    else:
+        # State handlers
+        state = context.user_data.get('state')
+
+        if state == 'register_email':
+            context.user_data['reg_email'] = text
+            context.user_data['state'] = 'register_password'
+            await update.message.reply_text("🔑 Please enter your password:")
+
+        elif state == 'register_password':
+            email = context.user_data.get('reg_email')
+            password = text
+
+            if len(password) < 6:
+                await update.message.reply_text("❌ Password must be at least 6 characters! Please enter again:")
+                return
+
+            await update.message.reply_text("⏳ Registering...")
+
+            client = CPMApiClient()
+            response = await client.register(email, password)
+
+            if response["ok"]:
+                keyboard = get_admin_keyboard() if is_master_admin(user_id) else get_user_keyboard()
+                await update.message.reply_text("✅ Registration successful! You can now login.", reply_markup=keyboard)
+            else:
+                error_msg = response.get('error', 'Registration failed')
+                keyboard = get_admin_keyboard() if is_master_admin(user_id) else get_user_keyboard()
+                if "already exists" in error_msg.lower():
+                    await update.message.reply_text("❌ This email is already registered!", reply_markup=keyboard)
+                else:
+                    await update.message.reply_text(f"❌ Error: {error_msg}", reply_markup=keyboard)
+
+            context.user_data.clear()
+
+        elif state == 'login_email':
+            context.user_data['login_email'] = text
+            context.user_data['state'] = 'login_password'
+            await update.message.reply_text("🔑 Please enter your password:")
+
+        elif state == 'login_password':
+            email = context.user_data.get('login_email')
+            password = text
+
+            await update.message.reply_text("⏳ Logging in...")
+
+            client = CPMApiClient()
+            response = await client.login(email, password)
+
+            if response["ok"]:
+                auth_token = response["data"].get("auth")
+                user_sessions[user_id]['auth_token'] = auth_token
+                user_sessions[user_id]['email'] = email
+                keyboard = get_admin_keyboard() if is_master_admin(user_id) else get_user_keyboard()
+                await update.message.reply_text(f" ✅ Welcome {email}!\nYou have successfully logged in!", reply_markup=keyboard)
+            else:
+                keyboard = get_admin_keyboard() if is_master_admin(user_id) else get_user_keyboard()
+                await update.message.reply_text(f" ❌ Error: {response.get('error', 'Login failed')}", reply_markup=keyboard)
+
+            context.user_data.clear()
+
+        elif state == 'change_password':
+            new_password = text
+
+            if len(new_password) < 6:
+                await update.message.reply_text("❌ Password must be at least 6 characters! Please enter again:")
+                return
+
+            await update.message.reply_text("⏳ Changing password...")
+
+            client = CPMApiClient()
+            response = await client.change_password(user_sessions[user_id]['auth_token'], new_password)
+
+            if response["ok"]:
+                keyboard = get_admin_keyboard() if is_master_admin(user_id) else get_user_keyboard()
+                await update.message.reply_text("✅ Password changed successfully!", reply_markup=keyboard)
+            else:
+                keyboard = get_admin_keyboard() if is_master_admin(user_id) else get_user_keyboard()
+                await update.message.reply_text(f" ❌ Error: {response.get('error', 'Failed to change password')}", reply_markup=keyboard)
+
+            context.user_data.clear()
+
+        elif state == 'change_email':
+            new_email = text
+
+            if '@' not in new_email or '.' not in new_email:
+                await update.message.reply_text("❌ Please enter a valid email address!")
+                return
+
+            await update.message.reply_text("⏳ Changing email...")
+
+            client = CPMApiClient()
+            response = await client.change_email(user_sessions[user_id]['auth_token'], new_email)
+
+            if response["ok"]:
+                user_sessions[user_id]['email'] = new_email
+                keyboard = get_admin_keyboard() if is_master_admin(user_id) else get_user_keyboard()
+                await update.message.reply_text("✅ Email changed successfully!", reply_markup=keyboard)
+            else:
+                keyboard = get_admin_keyboard() if is_master_admin(user_id) else get_user_keyboard()
+                await update.message.reply_text(f" ❌ Error: {response.get('error', 'Failed to change email')}", reply_markup=keyboard)
+
+            context.user_data.clear()
+
+        elif state == 'confirm_delete':
+            if text.upper() == "YES":
+                await update.message.reply_text("⏳ Deleting account...")
+
+                client = CPMApiClient()
+                response = await client.delete_account(user_sessions[user_id]['auth_token'])
+
+                if response["ok"]:
+                    user_sessions[user_id] = {
+                        'auth_token': None,
+                        'email': None,
+                        'last_activity': time.time()
+                    }
+                    keyboard = get_admin_keyboard() if is_master_admin(user_id) else get_user_keyboard()
+                    await update.message.reply_text("✅ Account deleted successfully!", reply_markup=keyboard)
+                else:
+                    keyboard = get_admin_keyboard() if is_master_admin(user_id) else get_user_keyboard()
+                    await update.message.reply_text(f"❌ Error: {response.get('error', 'Failed to delete account')}", reply_markup=keyboard)
+            else:
+                keyboard = get_admin_keyboard() if is_master_admin(user_id) else get_user_keyboard()
+                await update.message.reply_text("❌ Account deletion cancelled.", reply_markup=keyboard)
+
+            context.user_data.clear()
+
+        else:
+            keyboard = get_admin_keyboard() if is_master_admin(user_id) else get_user_keyboard()
+            await update.message.reply_text("❌ Invalid command! Please use the buttons below 👇", reply_markup=keyboard)
+
+# New chat members handler
+async def handle_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.new_chat_members:
+        return
+
+    for member in update.message.new_chat_members:
+        if member.id == context.bot.id:
+            return
+
+    user_id = str(update.effective_user.id)
+    if not is_allowed(user_id):
+        await send_access_denied(update)
+
+# ========== COMMANDS SETUP ==========
+async def set_bot_commands(app):
+    # Энгийн хэрэглэгчдэд харагдах команд
+    user_commands = [
+        BotCommand("start", "🤖 Start bot 💪"),
+    ]
+
+    # Admin-д харагдах команд
+    admin_commands = [
+        BotCommand("start", "🤖 Start bot 💪"),
+        BotCommand("list", "📋 List members ✨"),
+        BotCommand("add", "➕ Add member 👑"),
+        BotCommand("remove", "🚫 Delete member"),
+    ]
+
+    # Бүх хэрэглэгчдэд start команд харуулна
+    await app.bot.set_my_commands(user_commands)
+
+    # Admin-д тусгай команд харуулах
+    try:
+        await app.bot.set_my_commands(
+            admin_commands,
+            scope=BotCommandScopeChat(chat_id=MASTER_ADMIN_ID)
+        )
+    except Exception as e:
+        logger.error(f"Error setting admin commands: {e}")
+
+def main():
+    app = Application.builder().token(BOT_TOKEN).post_init(set_bot_commands).build()
+
+    # Command handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("list", list_users))
+    app.add_handler(CommandHandler("add", add_user))
+    app.add_handler(CommandHandler("remove", remove_user))
+
+    # Message handler
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, handle_new_chat_members))
+
+    print("=" * 60)
+    print("🤖 CPM BOT STARTED SUCCESSFULLY")
+    print("=" * 60)
+    print(f"👑 MASTER ADMIN: {MASTER_ADMIN_ID}")
+    print(f"📊 MEMBERS: {len(allowed_users)}")
+    print(f"📁 MEMBERS FILE: {ALLOWED_USERS_FILE}")
+    print("-" * 60)
+    print("📋 USER COMMANDS:")
+    print("   • /start - 🤖 Start bot 💪")
+    print("-" * 60)
+    print("📋 ADMIN COMMANDS:")
+    print("   • /start - 🤖 Start bot 💪")
+    print("   • /list - 📋 List members ✨")
+    print("   • /add - ➕ Add member 👑")
+    print("   • /remove - 🚫 Delete member")
+    print("-" * 60)
+    print("🎯 START MESSAGE:")
+    print('   • "😎 SEREKBOLIIN BOTOD TAWTAI MORILNO UU 😘"')
+    print('   • "Hello 🥀!"')
+    print('   • "👑 YOU ARE ADMIN 👑"')
+    print("-" * 60)
+    print("🎯 ACCESS DENIED MESSAGE:")
+    print('   • "🚫 Access Denied. • 🚫 Арил сда минь."')
+    print("-" * 60)
+    print("🎯 FEATURES:")
+    print("   • /add and /remove commands ask for ID")
+    print("   • Different keyboards for admin/users")
+    print("   • Different commands for admin/users")
+    print("   • Full CPM API integration")
+    print("   • 🚫 NO LOGS - Admin doesn't receive messages")
+    print("   • 🚫 NO LOG FILES")
+    print("=" * 60)
+    print("😎 SEREKBOLIIN BOTOD TAWTAI MORILNO UU  😘")
+    print("=" * 60)
+
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
+
+~
